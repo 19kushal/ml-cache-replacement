@@ -5,7 +5,7 @@ import joblib
 from sklearn.preprocessing import RobustScaler
 from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import classification_report, accuracy_score
-
+from sklearn.neural_network import MLPClassifier
 print("Loading dataset...")
 df = pd.read_csv(
     "data/kv-traces-2026.csv",
@@ -122,16 +122,23 @@ X_test_scaled = scaler.transform(X_test)
 # -------------------------
 # TRAIN MODEL
 # -------------------------
-print("Training model...")
-model = SGDClassifier(
-    loss='log_loss', 
-    max_iter=1000,
+print("Training Non-Linear Neural Network (Supports Online Adaptation)...")
+model = MLPClassifier(
+    hidden_layer_sizes=(64, 32),  # Two hidden layers to capture complex interactions
+    activation='relu',            # Non-linear activation function
+    solver='adam',                # Robust optimizer
+    max_iter=300,
     random_state=42,
-    class_weight='balanced'
+    # early_stopping=True           # Prevents the neural network from overfitting during initial training
 )
 
 model.fit(X_train_scaled, y_train)
 
+print("\n--- Diagnostic: Training vs Testing Accuracy ---")
+train_pred = model.predict(X_train_scaled)
+print(f"Training Accuracy: {accuracy_score(y_train, train_pred):.4f}")
+print(f"Testing Accuracy:  {accuracy_score(y_test, model.predict(X_test_scaled)):.4f}")
+print("----------------------------------------------\n")
 # -------------------------
 # EVALUATE
 # -------------------------
