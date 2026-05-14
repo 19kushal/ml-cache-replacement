@@ -1,176 +1,172 @@
 from collections import OrderedDict
 import numpy as np
+import pandas as pd
+import warnings
+
+# Suppress sklearn warnings about feature names during online learning
+warnings.filterwarnings("ignore", category=UserWarning)
 
 class MLCache:
-    def __init__(self, capacity, model, scaler, threshold):
+    def __init__(self, capacity, model, scaler):
         self.capacity = capacity
         self.cache = OrderedDict()
         self.model = model
         self.scaler = scaler
-        self.threshold = threshold
 
-        self.last_seen = {}
-        self.freq = {}
-        self.meta = {}        
-        self.history = []     
         self.time = 0
-        self.recent_freq_map = {}
+        self.last_seen = {}
+        self.frequency = {}
+        
+        # Sliding window for recent frequency
+        self.history = []
+        
+        # Online Learning Mini-Batch Queue
+        self.training_batch_X = []
+        self.training_batch_y = []
+        self.batch_size = 500  # Update the model every 500 accesses
 
-        self.rng = np.random.default_rng(42)
-
-
-    def _get_features(self, key):
+    def _get_features(self, key, op, size, key_size):
+        # 1. Recency
         if key in self.last_seen:
             recency = self.time - self.last_seen[key]
         else:
-            recency = 0   
-        frequency = self.freq.get(key, 0)
-        op, size, key_size = self.meta.get(key, (0, 0, 0))
-        # recent_freq = self.history.count(key)
-        recent_freq = self.recent_freq_map.get(key, 0)
+            recency = -1
 
-        # features = np.array([[recency, frequency, op, size, key_size, recent_freq]])
-        velocity = frequency / (recency + 1)
+        # 2. Frequency
+        freq = self.frequency.get(key, 0)
 
-        features = np.array([[
-            recency,
-            frequency,
-            op,
-            size,
-            key_size,
-            recent_freq,
-            velocity
-        ]])
+        # 3. Recent Frequency (sliding window)
+        recent = self.history.count(key)
 
-        features = np.nan_to_num(features)
-        return self.scaler.transform(features)
+        # Build feature dictionary to match training exactly
+        features = {
+            "recency": recency,
+            "frequency": freq,
+            "op": op,
+            "size": size,
+            "key_size": key_size,
+            "recent_freq": recent
+        }
+
+        df_features = pd.DataFrame([features])
+        
+        # Defensive check: ensure no NaNs sneak into the prediction vector
+        df_features.fillna(0, inplace=True)
+
+        # Apply the EXACT SAME Log-Transforms we used in training
+
+        # Apply the EXACT SAME Log-Transforms we used in training
+        skewed_features = ['recency', 'frequency', 'size', 'recent_freq']
+        for col in skewed_features:
+            df_features[col] = np.log1p(df_features[col].clip(lower=0))
+
+        # Scale and return
+        return self.scaler.transform(df_features)
     
     def access(self, key, op=0, size=0, key_size=0):
         self.time += 1
 
-        # update stats
-        self.freq[key] = self.freq.get(key, 0) + 1
-        self.meta[key] = (op, size, key_size)
-
+        # --- UPDATE TRACKING STATS ---
+        self.frequency[key] = self.frequency.get(key, 0) + 1
+        
         self.history.append(key)
-        self.recent_freq_map[key] = self.recent_freq_map.get(key, 0) + 1
+        if len(self.history) > 50:  # Keep window fixed at 50
+            self.history.pop(0)
 
-        if len(self.history) > 50:
-            old_key = self.history.pop(0)
+        # --- ONLINE LEARNING BATCHING ---
+        # Generate features for the current access
+        X_current = self._get_features(key, op, size, key_size)[0]
+        
+        # Define the online label: If we've seen it more than once, it's a "reuse"
+        y_current = 1 if self.frequency[key] > 1 else 0
 
-            self.recent_freq_map[old_key] -= 1
-            if self.recent_freq_map[old_key] <= 0:
-                del self.recent_freq_map[old_key]
+        self.training_batch_X.append(X_current)
+        self.training_batch_y.append(y_current)
 
-        # HIT
+        # If batch is full, adapt the model to new workload patterns
+        if len(self.training_batch_X) >= self.batch_size:
+            self.model.partial_fit(
+                self.training_batch_X, 
+                self.training_batch_y, 
+                classes=np.array([0, 1])
+            )
+            # Flush the queue
+            self.training_batch_X = []
+            self.training_batch_y = []
+
+        # --- CACHE HIT ---
         if key in self.cache:
             self.cache.move_to_end(key)
             self.last_seen[key] = self.time
+            # Update stored size metadata just in case
+            self.cache[key] = {'op': op, 'size': size, 'key_size': key_size}
             return True
 
-        # MISS
+        # --- CACHE MISS & EVICTION ---
+        # if len(self.cache) >= self.capacity:
+        #     cache_keys = list(self.cache.keys())
+            
+        #     # Sample candidates to save computation time (standard in ML caches)
+        #     candidate_size = min(30, len(cache_keys))
+        #     indices = np.random.choice(len(cache_keys), candidate_size, replace=False)
+        #     candidates = [cache_keys[i] for i in indices]
+
+        #     scores = {}
+
+        #     for k in candidates:
+        #         meta = self.cache[k]
+        #         features = self._get_features(k, meta['op'], meta['size'], meta['key_size'])
+                
+        #         # Get Probability of Reuse (Class 1)
+        #         prob_reuse = self.model.predict_proba(features)[0][1]
+
+        #         # CUSTOM LOGIC: Size-Aware Utility Score
+        #         # High prob_reuse = High Score (Keep it)
+        #         # High size = Lower Score (Evict it)
+        #         utility_score = prob_reuse / (meta['size'] + 1)
+
+        #         scores[k] = utility_score
+
+        #     # Evict the item with the ABSOLUTE LOWEST utility score
+        #     evict_key = min(scores, key=scores.get)
+        #     del self.cache[evict_key]
+        # --- CACHE MISS & EVICTION ---
         if len(self.cache) >= self.capacity:
-            # scores = {}
-            # # candidates = list(self.cache.keys())[:10]
-            # #   # only check 20 items
-            # cache_keys = list(self.cache.keys())
-
-            # candidate_size = min(20, len(cache_keys))
-
-            # indices = self.rng.choice(
-            #     len(cache_keys),
-            #     candidate_size,
-            #     replace=False
-            # )
-
-            # candidates = [cache_keys[i] for i in indices]
-            # # for k in candidates:
-            # #     features = self._get_features(k)
-            # #     prob = self.model.predict_proba(features)[0][1]
-
-            # #     # hybrid score (ML + recency)
-            # #     # recency = self.time - self.last_seen.get(k, self.time)
-            # #     # # score = (0.8 * prob) - (0.2 * (recency / self.capacity))
-            # #     # normalized_recency = min(recency / 100, 1.0)
-            # #     # score = (0.8 * prob) - (0.2 * normalized_recency)
-            # #     score = prob
-
-            # #     scores[k] = score
-
-
-            # # evict_key = min(scores, key=scores.get)
-            # eviction_candidates = {}
-
-            # for k in candidates:
-
-            #     features = self._get_features(k)
-
-            #     prob = self.model.predict_proba(features)[0][1]
-
-            #     # items below threshold are eviction candidates
-            #     if prob < self.threshold:
-            #         eviction_candidates[k] = prob
-
-            #     # fallback
-            #     scores[k] = prob
-
-            # # Prefer evicting low-confidence items
-            # if eviction_candidates:
-            #     evict_key = min(eviction_candidates, key=eviction_candidates.get)
-            # else:
-            #     evict_key = min(scores, key=scores.get)
-            #     del self.cache[evict_key]
-            scores = {}
-            eviction_candidates = {}
-
             cache_keys = list(self.cache.keys())
-
-            candidate_size = min(10, len(cache_keys))
-
-            indices = np.random.choice(
-                len(cache_keys),
-                candidate_size,
-                replace=False
-            )
-
+            
+            # DYNAMIC SAMPLING: Sample 10% of the cache, but at least 30 items
+            candidate_size = max(30, int(len(cache_keys) * 0.10))
+            candidate_size = min(candidate_size, len(cache_keys)) # Safety check
+            
+            indices = np.random.choice(len(cache_keys), candidate_size, replace=False)
             candidates = [cache_keys[i] for i in indices]
 
+            scores = {}
+
             for k in candidates:
+                meta = self.cache[k]
+                features = self._get_features(k, meta['op'], meta['size'], meta['key_size'])
+                
+                # Get Probability of Reuse (Class 1)
+                prob_reuse = self.model.predict_proba(features)[0][1]
 
-                features = self._get_features(k)
+                # HYBRID SCORE: ML Probability + Recency Safety Net
+                # Calculate how "stale" the item is relative to the cache capacity
+                recency_staleness = (self.time - self.last_seen.get(k, self.time)) / self.capacity
+                normalized_staleness = min(recency_staleness, 1.0)
 
-                prob = self.model.predict_proba(features)[0][1]
+                # We heavily weight the ML probability (80%), but penalize items that have been sitting 
+                # untouched for a very long time (20%) to prevent "dead" items from clogging the cache.
+                hybrid_score = (0.8 * prob_reuse) - (0.2 * normalized_staleness)
 
-                scores[k] = prob
+                scores[k] = hybrid_score
 
-                # low confidence items become eviction candidates
-                if prob < self.threshold:
-                    eviction_candidates[k] = prob
-
-            # choose eviction victim
-            if eviction_candidates:
-                evict_key = min(
-                    eviction_candidates,
-                    key=eviction_candidates.get
-                )
-            else:
-                evict_key = min(scores, key=scores.get)
-
-# IMPORTANT
+            # Evict the item with the ABSOLUTE LOWEST hybrid score
+            evict_key = min(scores, key=scores.get)
             del self.cache[evict_key]
 
-        self.cache[key] = True
+        # --- INSERT NEW ITEM ---
+        self.cache[key] = {'op': op, 'size': size, 'key_size': key_size}
         self.last_seen[key] = self.time
 
-        # if self.time % 100 == 0:
-
-        #     X_online = np.vstack([
-        #     self._get_features(key),
-        #     self._get_features(key)
-        #     ])
-
-        #     y_online = np.array([0, 1])
-        #     self.model.partial_fit(X_online, y_online)
-
         return False
-    
