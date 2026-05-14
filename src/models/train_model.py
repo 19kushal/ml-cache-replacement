@@ -1,158 +1,112 @@
 import pandas as pd
 import numpy as np
 import joblib
+import warnings
 
 from sklearn.preprocessing import RobustScaler
-from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.neural_network import MLPClassifier
-print("Loading dataset...")
-df = pd.read_csv(
-    "data/kv-traces-2026.csv",
-    nrows=200000
-)
 
-# -------------------------
-# PREPROCESSING
-# -------------------------
-print("Preprocessing...")
-df['op'] = df['op'].map({'GET': 0, 'SET': 1})
+warnings.filterwarnings("ignore")
 
-# -------------------------
-# FEATURE ENGINEERING
-# -------------------------
-print("Creating recency feature...")
-last_seen = {}
-recency = []
-for i, key in enumerate(df['key']):
-    if key in last_seen:
-        recency.append(i - last_seen[key])
-    else:
-        recency.append(-1)
-    last_seen[key] = i
-df['recency'] = recency
+def main():
+    print("Loading dataset...")
+    raw_data = pd.read_csv("data/kv-traces-2026.csv", nrows=200000)
 
-print("Creating frequency feature...")
-freq = {}
-frequency = []
-for key in df['key']:
-    freq[key] = freq.get(key, 0) + 1
-    frequency.append(freq[key])
-df['frequency'] = frequency
+    # Preprocessing
+    raw_data['op'] = raw_data['op'].map({'GET': 0, 'SET': 1})
 
-print("Creating recent frequency feature...")
-window = 50
-recent_freq = []
-history = []
-for key in df['key']:
-    history.append(key)
-    if len(history) > window:
-        history.pop(0)
-    recent_freq.append(history.count(key))
-df['recent_freq'] = recent_freq
+    # recency
+    last_access = {}
+    recency_feats = []
+    for i, key in enumerate(raw_data['key']):
+        if key in last_access:
+            recency_feats.append(i - last_access[key])
+        else:
+            recency_feats.append(-1)
+        last_access[key] = i
+    raw_data['recency'] = recency_feats
 
-# -------------------------
-# CREATE LABELS
-# -------------------------
-print("Creating labels...")
-K = 500
-labels = []
-keys = df['key'].tolist()
+    # global frequency
+    cumulative_freq = {}
+    freq_feats = []
+    for key in raw_data['key']:
+        cumulative_freq[key] = cumulative_freq.get(key, 0) + 1
+        freq_feats.append(cumulative_freq[key])
+    raw_data['frequency'] = freq_feats
 
-for i in range(len(keys)):
-    future_window = keys[i+1:i+K+1]
-    if keys[i] in future_window:
-        labels.append(1)
-    else:
-        labels.append(0)
-df['label'] = labels
+    # Short-term Frequency
+    window_size = 50
+    recent_freq_feats = []
+    history_buffer = []
+    for key in raw_data['key']:
+        history_buffer.append(key)
+        if len(history_buffer) > window_size:
+            history_buffer.pop(0)
+        recent_freq_feats.append(history_buffer.count(key))
+    raw_data['recent_freq'] = recent_freq_feats
 
-# -------------------------
-# CLEAN DATA
-# -------------------------
-print("Cleaning data...")
-df.replace([np.inf, -np.inf], np.nan, inplace=True)
-df.fillna(0, inplace=True)
+    lookahead = 500
+    labels = []
+    keys_array = raw_data['key'].values
 
-# -------------------------
-# FEATURES & TRANSFORMATIONS
-# -------------------------
-features = [
-    'recency',
-    'frequency',
-    'op',
-    'size',
-    'key_size',
-    'recent_freq'
-]
+    for i in range(len(keys_array)):
+        future_segment = keys_array[i+1 : i + lookahead + 1]
+        labels.append(1 if keys_array[i] in future_segment else 0)
+    raw_data['label'] = labels
 
-X = df[features].copy()
-y = df['label']
+    raw_data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    raw_data.fillna(0, inplace=True)
 
-print("Applying Log-Transform for Zipfian Distributions...")
-# Apply log transform to heavily skewed features to normalize them
-skewed_features = ['recency', 'frequency', 'size', 'recent_freq']
-for col in skewed_features:
-    # np.log1p safely handles zeros by calculating log(1 + x)
-    # We clip to 0 to prevent negative values from causing NaN errors
-    X[col] = np.log1p(X[col].clip(lower=0))
+    # feature selection
+    feature_cols = ['recency', 'frequency', 'op', 'size', 'key_size', 'recent_freq']
+    X = raw_data[feature_cols].copy()
+    y = raw_data['label']
 
-# -------------------------
-# CHRONOLOGICAL TRAIN/TEST SPLIT
-# -------------------------
-print("Performing Chronological Split (No Data Leakage)...")
-# We MUST split sequentially to prove the model can predict future accesses
-split_idx = int(len(df) * 0.8)
+    # Log transformation for Zzipfian
+    skewed_cols = ['recency', 'frequency', 'size', 'recent_freq']
+    for col in skewed_cols:
+        X[col] = np.log1p(X[col].clip(lower=0))
 
-X_train = X.iloc[:split_idx]
-X_test = X.iloc[split_idx:]
-y_train = y.iloc[:split_idx]
-y_test = y.iloc[split_idx:]
+    # train test split
+    split_point = int(len(raw_data) * 0.8)
 
-# -------------------------
-# SCALE FEATURES
-# -------------------------
-print("Scaling features using RobustScaler...")
-# RobustScaler uses median/quantiles, making it robust to massive cache outliers
-scaler = RobustScaler()
+    X_train, X_test = X.iloc[:split_point], X.iloc[split_point:]
+    y_train, y_test = y.iloc[:split_point], y.iloc[split_point:]
 
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+    # feature scaling
+    print("Normalizing features via RobustScaler...")
+    std_scaler = RobustScaler()
+    X_train_scaled = std_scaler.fit_transform(X_train)
+    X_test_scaled = std_scaler.transform(X_test)
 
-# -------------------------
-# TRAIN MODEL
-# -------------------------
-print("Training Non-Linear Neural Network (Supports Online Adaptation)...")
-model = MLPClassifier(
-    hidden_layer_sizes=(64, 32),  # Two hidden layers to capture complex interactions
-    activation='relu',            # Non-linear activation function
-    solver='adam',                # Robust optimizer
-    max_iter=300,
-    random_state=42,
-    # early_stopping=True           # Prevents the neural network from overfitting during initial training
-)
+    # model training
+    mlp = MLPClassifier(
+        hidden_layer_sizes=(64, 32),
+        activation='relu',
+        solver='adam',
+        max_iter=300,
+        random_state=42
+    )
 
-model.fit(X_train_scaled, y_train)
+    mlp.fit(X_train_scaled, y_train)
 
-print("\n--- Diagnostic: Training vs Testing Accuracy ---")
-train_pred = model.predict(X_train_scaled)
-print(f"Training Accuracy: {accuracy_score(y_train, train_pred):.4f}")
-print(f"Testing Accuracy:  {accuracy_score(y_test, model.predict(X_test_scaled)):.4f}")
-print("----------------------------------------------\n")
-# -------------------------
-# EVALUATE
-# -------------------------
-print("Evaluating model...")
-y_pred = model.predict(X_test_scaled)
+    # Diagnostics
+    train_acc = accuracy_score(y_train, mlp.predict(X_train_scaled))
+    test_acc = accuracy_score(y_test, mlp.predict(X_test_scaled))
+    
+    print(f"\nTraining Accuracy: {train_acc:.4f}")
+    print(f"Testing Accuracy:  {test_acc:.4f}\n")
 
-print("Accuracy:", accuracy_score(y_test, y_pred))
-print(classification_report(y_test, y_pred))
+    # Evaluation
+    y_pred = mlp.predict(X_test_scaled)
+    print("Classification Report:")
+    print(classification_report(y_test, y_pred))
 
-# -------------------------
-# SAVE MODEL
-# -------------------------
-print("Saving model...")
-joblib.dump(model, "src/models/model.pkl")
-joblib.dump(scaler, "src/models/scaler.pkl")
+    # Serialization
+    joblib.dump(mlp, "src/models/model.pkl")
+    joblib.dump(std_scaler, "src/models/scaler.pkl")
+    print("Model saved")
 
-print("DONE")
+if __name__ == "__main__":
+    main()

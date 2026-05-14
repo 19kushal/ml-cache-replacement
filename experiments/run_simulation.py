@@ -11,70 +11,75 @@ from src.simulator.lru import LRUCache
 from src.simulator.ml_cache import DreamOnCache
 
 np.random.seed(42)
+# cache simulation for LRU and ML-based implementation 
+def run_policy(cache, trace_df):
 
-def run_policy(cache, df):
     hits = 0
-    # Using tqdm to show progress bars for the simulation
-    for row in tqdm(
-        df.itertuples(index=False),
-        total=len(df),
-        desc=f"Running {cache.__class__.__name__}"
+    total_requests = len(trace_df)
+    
+    for req in tqdm(
+        trace_df.itertuples(index=False),
+        total=total_requests,
+        desc=f"Simulating {cache.__class__.__name__}"
     ):
-        # We use try/except because LRU/FIFO might not take size/op arguments in their original implementations
-        try:
-            hit = cache.access(row.key, row.op, row.size, row.key_size)
-        except TypeError:
-            hit = cache.access(row.key)
 
-        if hit:
+        try:
+            is_hit = cache.access(req.key, req.op, req.size, req.key_size)
+        except TypeError:
+            is_hit = cache.access(req.key)
+
+        if is_hit:
             hits += 1
 
-    return hits / len(df)
+    return hits / total_requests
 
 def main():
-    print("Loading trace data for simulation...")
-    df = pd.read_csv("data/kv-traces-2026.csv", nrows=50000)
-    df['op'] = df['op'].map({'GET': 0, 'SET': 1}).fillna(0)
-    df.fillna(0, inplace=True) 
+    # Dataset initialization
+    print("Loading trace data...")
+    data = pd.read_csv("data/kv-traces-2026.csv", nrows=50000)
+    data['op'] = data['op'].map({'GET': 0, 'SET': 1}).fillna(0)
+    data.fillna(0, inplace=True) 
 
-    print("Loading trained ML base model and scaler...")
-    base_model = joblib.load("src/models/model.pkl")
-    scaler = joblib.load("src/models/scaler.pkl")
+    
+    print("Loading model artifacts...")
+    clf = joblib.load("src/models/model.pkl")
+    std_scaler = joblib.load("src/models/scaler.pkl")
 
-    capacities = [50, 100, 250, 500, 1000]
-    final_results = []
+    
+    cache_sizes = [50, 100, 250, 500, 1000]
+    metrics = []
 
-    for capacity in capacities:
-        print(f"\n=========================================")
-        print(f" EVALUATING CACHE CAPACITY: {capacity}")
-        print(f"=========================================")
-
-        lru_cache = LRUCache(capacity)
+    for size in cache_sizes:
+        print(f"\nEvaluating Capacity: {size}")
         
-        # 1. Static ML Cache (No Online Learning)
-        ml_cache_static = DreamOnCache(capacity, base_model, scaler, online_learning=False)
+        # Baseline: LRU
+        lru = LRUCache(size)
         
-        # 2. Online ML Cache (Requires a deepcopy so it doesn't mutate the base model)
-        online_model = copy.deepcopy(base_model)
-        ml_cache_online = DreamOnCache(capacity, online_model, scaler, online_learning=True)
+        # Policy 1: Static ML inference
+        static_ml = DreamOnCache(size, clf, std_scaler, online_learning=False)
+        
+        # Policy 2: ML with online adaptation
+        dynamic_clf = copy.deepcopy(clf)
+        online_ml = DreamOnCache(size, dynamic_clf, std_scaler, online_learning=True)
 
-        lru_hit = run_policy(lru_cache, df)
-        ml_static_hit = run_policy(ml_cache_static, df)
-        ml_online_hit = run_policy(ml_cache_online, df)
+        # Execute simulations
+        lru_rate = run_policy(lru, data)
+        static_rate = run_policy(static_ml, data)
+        online_rate = run_policy(online_ml, data)
         
-        final_results.append({
-            'Capacity': capacity,
-            'LRU': round(lru_hit, 4),
-            'ML_Static': round(ml_static_hit, 4),
-            'ML_Online': round(ml_online_hit, 4)
+        metrics.append({
+            'Capacity': size,
+            'LRU_HitRate': round(lru_rate, 4),
+            'ML_Static_HitRate': round(static_rate, 4),
+            'ML_Online_HitRate': round(online_rate, 4)
         })
 
-    print("\n" + "="*50)
-    print(" FINAL SIMULATION RESULTS (ABLATION STUDY) ")
-    print("="*50)
+    # Results
+    print("\nSimulation Result:")
+    summary_df = pd.DataFrame(metrics)
+    print(summary_df.to_string(index=False))
     
-    results_df = pd.DataFrame(final_results)
-    print(results_df.to_string(index=False))
-    results_df.to_csv("simulation_results_ablation.csv", index=False)
+    summary_df.to_csv("simulation_results_ablation.csv", index=False)
+
 if __name__ == "__main__":
     main()
