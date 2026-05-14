@@ -178,18 +178,20 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-class MLCache:
-    def __init__(self, capacity, model, scaler):
+class DreamOnCache:
+    def __init__(self, capacity, model, scaler, online_learning=True):
         self.capacity = capacity
         self.cache = OrderedDict()
         self.model = model
         self.scaler = scaler
+        
+        # New toggle flag
+        self.online_learning = online_learning
 
         self.time = 0
         self.last_seen = {}
         self.frequency = {}
         
-        # OPTIMIZATION 1: Use a Hash Map (dict) for O(1) recent frequency lookups
         self.history = []
         self.recent_freq_map = {} 
         
@@ -232,14 +234,10 @@ class MLCache:
         self.training_batch_y.append(y_current)
 
         # OPTIMIZATION 2: Batch scale and fit the online learning
-        if len(self.training_batch_X) >= self.batch_size:
-            # Convert to NumPy array
+        if self.online_learning and len(self.training_batch_X) >= self.batch_size:
             X_batch = np.array(self.training_batch_X, dtype=np.float64)
-            
-            # Apply log1p to skewed features: indices 0(recency), 1(frequency), 3(size), 5(recent_freq)
             X_batch[:, [0, 1, 3, 5]] = np.log1p(X_batch[:, [0, 1, 3, 5]])
             
-            # Scale and fit
             X_batch_scaled = self.scaler.transform(X_batch)
             self.model.partial_fit(X_batch_scaled, self.training_batch_y, classes=np.array([0, 1]))
             
